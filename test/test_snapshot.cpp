@@ -5,6 +5,7 @@
 // Date: 2015/10/08 17:00:05
 
 #include <gtest/gtest.h>
+#include <gflags/gflags.h>
 #include <butil/logging.h>
 #include <butil/file_util.h>
 #include <errno.h>
@@ -15,6 +16,10 @@
 #include "braft/local_file_meta.pb.h"
 #include "braft/snapshot_throttle.h"
 #include "memory_file_system_adaptor.h"
+
+namespace logging {
+DECLARE_int32(minloglevel);
+};
 
 class SnapshotTest : public testing::Test {
 protected:
@@ -350,6 +355,9 @@ void *write_thread(void* arg) {
 }
 
 TEST_F(SnapshotTest, thread_safety) {
+    // writer thread will make much log when sleep
+    logging::FLAGS_minloglevel = 1;
+
     braft::FileSystemAdaptor* fs;
     FOR_EACH_FILE_SYSTEM_ADAPTOR_BEGIN(fs);
 
@@ -373,6 +381,8 @@ TEST_F(SnapshotTest, thread_safety) {
     delete storage;
 
     FOR_EACH_FILE_SYSTEM_ADAPTOR_END;
+
+    logging::FLAGS_minloglevel = 0;
 }
 
 void write_file(braft::FileSystemAdaptor* fs, const std::string& path, const std::string& data) {
@@ -395,8 +405,15 @@ void add_file_meta(braft::FileSystemAdaptor* fs, braft::SnapshotWriter* writer, 
     if (checksum) {
         file_meta.set_checksum(*checksum);
     }
-    write_file(fs, writer->get_path() + "/" + path.str(), path.str() + data);
+    write_file(fs, writer->get_path() + "/" + path.str(), path.str() + ": " + data);
     ASSERT_EQ(0, writer->add_file(path.str(), &file_meta));
+}
+
+void add_file_without_meta(braft::FileSystemAdaptor* fs, braft::SnapshotWriter* writer, int index, 
+                   const std::string& data) {
+    std::stringstream path;
+    path << "file" << index;
+    write_file(fs, writer->get_path() + "/" + path.str(), path.str() + ": " + data);
 }
 
 bool check_file_exist(braft::FileSystemAdaptor* fs, const std::string& path, int index) {
@@ -512,6 +529,8 @@ TEST_F(SnapshotTest, filter_before_copy) {
     add_file_meta(fs, writer2, 4, &checksum2, data2);
     // file not exist in remote, will delete
     add_file_meta(fs, writer2, 100, &checksum2, data2);
+    // file exit but meta not exit, will delete
+    add_file_without_meta(fs, writer2, 102, data2);
 
     ASSERT_EQ(0, writer2->save_meta(meta));
     ASSERT_EQ(0, storage2->close(writer2));
@@ -527,15 +546,15 @@ TEST_F(SnapshotTest, filter_before_copy) {
     meta.set_last_included_index(901);
     const std::string data3("ccc");
     const std::string checksum3("3");
-    // same checksum, will not copy
+    // same checksum, will copy from last_snapshot with index=901
     add_file_meta(fs, writer2, 6, &checksum1, data3);
-    // remote checksum not set, local set, will copy
+    // remote checksum not set, local last_snapshot set, will copy
     add_file_meta(fs, writer2, 7, &checksum1, data3);
-    // remote checksum set, local not set, will copy
+    // remote checksum set, local last_snapshot not set, will copy
     add_file_meta(fs, writer2, 8, NULL, data3);
-    // different checksum, will copy
+    // remote and local last_snapshot different checksum, will copy
     add_file_meta(fs, writer2, 9, &checksum3, data3);
-    // file not exist in remote, will delete
+    // file not exist in remote, will not copy
     add_file_meta(fs, writer2, 101, &checksum3, data3);
     ASSERT_EQ(0, writer2->save_meta(meta));
     ASSERT_EQ(0, storage2->close(writer2));
@@ -556,7 +575,7 @@ TEST_F(SnapshotTest, filter_before_copy) {
     for (int i = 1; i <= 9; ++i) {
         ASSERT_TRUE(check_file_exist(fs, snapshot_path, i));
         std::stringstream content;
-        content << "file" << i;
+        content << "file" << i << ": ";
         if (i == 1) {
             content << data2;
         } else if (i == 6) {
@@ -568,6 +587,7 @@ TEST_F(SnapshotTest, filter_before_copy) {
     }
     ASSERT_TRUE(!check_file_exist(fs, snapshot_path, 100));
     ASSERT_TRUE(!check_file_exist(fs, snapshot_path, 101));
+    ASSERT_TRUE(!check_file_exist(fs, snapshot_path, 102));
 
     delete storage2;
     delete storage1;
@@ -607,7 +627,7 @@ TEST_F(SnapshotTest, snapshot_throttle_for_reading) {
     if (fs) {
         ASSERT_EQ(storage1->set_file_system_adaptor(fs), 0);
     }
-    // create and set snapshot throttle
+    // create and set snapshot throttle for storage1
     braft::ThroughputSnapshotThrottle* throttle = new 
         braft::ThroughputSnapshotThrottle(60, 10);
     ASSERT_TRUE(throttle);
@@ -709,12 +729,17 @@ TEST_F(SnapshotTest, snapshot_throttle_for_writing) {
         fs->delete_file("data2", true);
     }
     braft::SnapshotStorage* storage2 = new braft::LocalSnapshotStorage("./data2");
+    // create and set snapshot throttle for storage2
+    braft::ThroughputSnapshotThrottle* throttle2 = new 
+        braft::ThroughputSnapshotThrottle(3 * 1000 * 1000, 10);
+    ASSERT_TRUE(throttle2);
+    ASSERT_EQ(storage2->set_snapshot_throttle(throttle2), 0);
     if (fs) {
         ASSERT_EQ(storage2->set_file_system_adaptor(fs), 0);
     }
     // create and set snapshot throttle for storage2
     braft::SnapshotThrottle* throttle = 
-        new braft::ThroughputSnapshotThrottle(50, 10);
+        new braft::ThroughputSnapshotThrottle(20, 10);
     ASSERT_TRUE(throttle);
     ASSERT_EQ(storage2->set_snapshot_throttle(throttle), 0);
     ASSERT_EQ(0, storage2->init());
@@ -731,4 +756,254 @@ TEST_F(SnapshotTest, snapshot_throttle_for_writing) {
     delete storage1;
 
     FOR_EACH_FILE_SYSTEM_ADAPTOR_END;
+}
+
+TEST_F(SnapshotTest, snapshot_throttle_for_reading_without_enable_throttle) {
+    GFLAGS_NS::SetCommandLineOption("raft_enable_throttle_when_install_snapshot", "false");
+    braft::FileSystemAdaptor* fs;
+    FOR_EACH_FILE_SYSTEM_ADAPTOR_BEGIN(fs);
+
+    if (fs == NULL) {
+        ::system("rm -rf data");
+    } else {
+        fs->delete_file("data", true);
+    }
+
+    brpc::Server server;
+    ASSERT_EQ(0, braft::add_service(&server, "0.0.0.0:6006"));
+    ASSERT_EQ(0, server.Start(6006, NULL));
+
+    std::vector<braft::PeerId> peers;
+    peers.push_back(braft::PeerId("1.2.3.4:1000"));
+    peers.push_back(braft::PeerId("1.2.3.4:2000"));
+    peers.push_back(braft::PeerId("1.2.3.4:3000"));
+
+    braft::SnapshotMeta meta;
+    meta.set_last_included_index(1000);
+    meta.set_last_included_term(2);
+    for (size_t i = 0; i < peers.size(); ++i) {
+        *meta.add_peers() = peers[i].to_string();
+    }
+
+    // storage1
+    braft::LocalSnapshotStorage* storage1 = new braft::LocalSnapshotStorage("./data");
+    ASSERT_TRUE(storage1);
+    if (fs) {
+        ASSERT_EQ(storage1->set_file_system_adaptor(fs), 0);
+    }
+    // create and set snapshot throttle for storage1
+    braft::ThroughputSnapshotThrottle* throttle = new
+        braft::ThroughputSnapshotThrottle(30, 10);
+    ASSERT_TRUE(throttle);
+    ASSERT_EQ(storage1->set_snapshot_throttle(throttle), 0);
+    ASSERT_EQ(0, storage1->init());
+    storage1->set_server_addr(butil::EndPoint(butil::my_ip(), 6006));
+    // normal create writer
+    braft::SnapshotWriter* writer1 = storage1->create();
+    ASSERT_TRUE(writer1 != NULL);
+    // add file meta for storage1
+    const std::string data1("aaa");
+    const std::string checksum1("1");
+    add_file_meta(fs, writer1, 1, &checksum1, data1);
+
+    ASSERT_EQ(0, writer1->save_meta(meta));
+    ASSERT_EQ(0, storage1->close(writer1));
+
+    braft::SnapshotReader* reader1 = storage1->open();
+    ASSERT_TRUE(reader1 != NULL);
+    std::string uri = reader1->generate_uri_for_copy();
+
+    // storage2
+    if (fs == NULL) {
+        ::system("rm -rf data2");
+    } else {
+        fs->delete_file("data2", true);
+    }
+    braft::SnapshotStorage* storage2 = new braft::LocalSnapshotStorage("./data2");
+    // create and set snapshot throttle for storage2
+    braft::ThroughputSnapshotThrottle* throttle2 = new
+        braft::ThroughputSnapshotThrottle(3 * 1000 * 1000, 10);
+    ASSERT_TRUE(throttle2);
+    ASSERT_EQ(storage2->set_snapshot_throttle(throttle2), 0);
+    if (fs) {
+        ASSERT_EQ(storage2->set_file_system_adaptor(fs), 0);
+    }
+    ASSERT_EQ(0, storage2->init());
+    // copy
+    braft::SnapshotReader* reader2 = storage2->copy_from(uri);
+    LOG(INFO) << "Copy finish.";
+    ASSERT_TRUE(reader2 != NULL);
+    ASSERT_EQ(0, storage1->close(reader1));
+    ASSERT_EQ(0, storage2->close(reader2));
+    delete storage2;
+    delete storage1;
+
+    FOR_EACH_FILE_SYSTEM_ADAPTOR_END;
+    GFLAGS_NS::SetCommandLineOption("raft_enable_throttle_when_install_snapshot", "true");
+}
+
+TEST_F(SnapshotTest, snapshot_throttle_for_writing_without_enable_throttle) {
+    GFLAGS_NS::SetCommandLineOption("raft_enable_throttle_when_install_snapshot", "false");
+    braft::FileSystemAdaptor* fs;
+    FOR_EACH_FILE_SYSTEM_ADAPTOR_BEGIN(fs);
+
+    if (fs == NULL) {
+        ::system("rm -rf data");
+    } else {
+        fs->delete_file("data", true);
+    }
+
+    brpc::Server server;
+    ASSERT_EQ(0, braft::add_service(&server, "0.0.0.0:6006"));
+    ASSERT_EQ(0, server.Start(6006, NULL));
+
+    std::vector<braft::PeerId> peers;
+    peers.push_back(braft::PeerId("1.2.3.4:1000"));
+    peers.push_back(braft::PeerId("1.2.3.4:2000"));
+    peers.push_back(braft::PeerId("1.2.3.4:3000"));
+
+    braft::SnapshotMeta meta;
+    meta.set_last_included_index(1000);
+    meta.set_last_included_term(2);
+    for (size_t i = 0; i < peers.size(); ++i) {
+        *meta.add_peers() = peers[i].to_string();
+    }
+
+    // storage1
+    braft::LocalSnapshotStorage* storage1 = new braft::LocalSnapshotStorage("./data");
+    ASSERT_TRUE(storage1);
+    if (fs) {
+        ASSERT_EQ(storage1->set_file_system_adaptor(fs), 0);
+    }
+    ASSERT_EQ(0, storage1->init());
+    storage1->set_server_addr(butil::EndPoint(butil::my_ip(), 6006));
+    // create writer1
+    braft::SnapshotWriter* writer1 = storage1->create();
+    ASSERT_TRUE(writer1 != NULL);
+    // add nomal file for storage1
+    LOG(INFO) << "add nomal file";
+    const std::string data1("aaa");
+    const std::string checksum1("1000");
+    add_file_meta(fs, writer1, 1, &checksum1, data1);
+    // save snapshot meta for storage1
+    ASSERT_EQ(0, writer1->save_meta(meta));
+    ASSERT_EQ(0, storage1->close(writer1));
+    // get uri of storage1
+    braft::SnapshotReader* reader1 = storage1->open();
+    ASSERT_TRUE(reader1 != NULL);
+    std::string uri = reader1->generate_uri_for_copy();
+
+    // storage2
+    if (fs == NULL) {
+        ::system("rm -rf data2");
+    } else {
+        fs->delete_file("data2", true);
+    }
+    braft::SnapshotStorage* storage2 = new braft::LocalSnapshotStorage("./data2");
+    if (fs) {
+        ASSERT_EQ(storage2->set_file_system_adaptor(fs), 0);
+    }
+    // create and set snapshot throttle for storage2
+    braft::SnapshotThrottle* throttle =
+        new braft::ThroughputSnapshotThrottle(20, 10);
+    ASSERT_TRUE(throttle);
+    ASSERT_EQ(storage2->set_snapshot_throttle(throttle), 0);
+    ASSERT_EQ(0, storage2->init());
+
+    // copy from storage1 to storage2
+    LOG(INFO) << "Copy start.";
+    braft::SnapshotCopier* copier = storage2->start_to_copy_from(uri);
+    ASSERT_TRUE(copier != NULL);
+    copier->join();
+    LOG(INFO) << "Copy finish.";
+    ASSERT_EQ(0, storage1->close(reader1));
+    ASSERT_EQ(0, storage2->close(copier));
+    delete storage2;
+    delete storage1;
+
+    FOR_EACH_FILE_SYSTEM_ADAPTOR_END;
+    GFLAGS_NS::SetCommandLineOption("raft_enable_throttle_when_install_snapshot", "true");
+}
+
+TEST_F(SnapshotTest, dynamically_change_throttle_threshold) {
+    GFLAGS_NS::SetCommandLineOption("raft_minimal_throttle_threshold_mb", "1");
+    braft::FileSystemAdaptor* fs;
+    FOR_EACH_FILE_SYSTEM_ADAPTOR_BEGIN(fs);
+
+    if (fs == NULL) {
+        ::system("rm -rf data");
+    } else {
+        fs->delete_file("data", true);
+    }
+
+    brpc::Server server;
+    ASSERT_EQ(0, braft::add_service(&server, "0.0.0.0:6006"));
+    ASSERT_EQ(0, server.Start(6006, NULL));
+
+    std::vector<braft::PeerId> peers;
+    peers.push_back(braft::PeerId("1.2.3.4:1000"));
+    peers.push_back(braft::PeerId("1.2.3.4:2000"));
+    peers.push_back(braft::PeerId("1.2.3.4:3000"));
+
+    braft::SnapshotMeta meta;
+    meta.set_last_included_index(1000);
+    meta.set_last_included_term(2);
+    for (size_t i = 0; i < peers.size(); ++i) {
+        *meta.add_peers() = peers[i].to_string();
+    }
+
+    // storage1
+    braft::LocalSnapshotStorage* storage1 = new braft::LocalSnapshotStorage("./data");
+    ASSERT_TRUE(storage1);
+    if (fs) {
+        ASSERT_EQ(storage1->set_file_system_adaptor(fs), 0);
+    }
+    ASSERT_EQ(0, storage1->init());
+    storage1->set_server_addr(butil::EndPoint(butil::my_ip(), 6006));
+    // create writer1
+    braft::SnapshotWriter* writer1 = storage1->create();
+    ASSERT_TRUE(writer1 != NULL);
+    // add nomal file for storage1
+    LOG(INFO) << "add nomal file";
+    const std::string data1("aaa");
+    const std::string checksum1("1000");
+    add_file_meta(fs, writer1, 1, &checksum1, data1);
+    // save snapshot meta for storage1
+    ASSERT_EQ(0, writer1->save_meta(meta));
+    ASSERT_EQ(0, storage1->close(writer1));
+    // get uri of storage1
+    braft::SnapshotReader* reader1 = storage1->open();
+    ASSERT_TRUE(reader1 != NULL);
+    std::string uri = reader1->generate_uri_for_copy();
+
+    // storage2
+    if (fs == NULL) {
+        ::system("rm -rf data2");
+    } else {
+        fs->delete_file("data2", true);
+    }
+    braft::SnapshotStorage* storage2 = new braft::LocalSnapshotStorage("./data2");
+    if (fs) {
+        ASSERT_EQ(storage2->set_file_system_adaptor(fs), 0);
+    }
+    // create and set snapshot throttle for storage2
+    braft::SnapshotThrottle* throttle =
+        new braft::ThroughputSnapshotThrottle(10, 10);
+    ASSERT_TRUE(throttle);
+    ASSERT_EQ(storage2->set_snapshot_throttle(throttle), 0);
+    ASSERT_EQ(0, storage2->init());
+
+    // copy from storage1 to storage2
+    LOG(INFO) << "Copy start.";
+    braft::SnapshotCopier* copier = storage2->start_to_copy_from(uri);
+    ASSERT_TRUE(copier != NULL);
+    copier->join();
+    LOG(INFO) << "Copy finish.";
+    ASSERT_EQ(0, storage1->close(reader1));
+    ASSERT_EQ(0, storage2->close(copier));
+    delete storage2;
+    delete storage1;
+
+    FOR_EACH_FILE_SYSTEM_ADAPTOR_END;
+    GFLAGS_NS::SetCommandLineOption("raft_minimal_throttle_threshold_mb", "0");
 }
